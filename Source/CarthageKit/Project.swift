@@ -208,7 +208,7 @@ public final class Project { // swiftlint:disable:this type_body_length
 
 	/// Limits the number of concurrent clones/fetches to the number of active
 	/// processors.
-	private let cloneOrFetchQueue = ConcurrentProducerQueue(name: "org.carthage.CarthageKit", limit: ProcessInfo.processInfo.activeProcessorCount)
+	private let cloneOrFetchQueue = ConcurrentProducerQueue(name: "org.carthage.CarthageKit", limit: 1)
 
 	/// Clones the given dependency to the global repositories folder, or fetches
 	/// inside it if it has already been cloned.
