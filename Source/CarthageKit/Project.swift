@@ -1521,6 +1521,16 @@ internal func relativeLinkDestination(for dependency: Dependency, subdirectory: 
 	return linkDestinationPath
 }
 
+/// Used to memoize `cloneOrFetch` by looking up a signal producer corresponding
+/// to a given repository URL.  Because the producer returned by `cloneOrFetch`
+/// is replayable (with replayLazily), it has reference semantics and the _same_
+/// producer should be returned on subsequent calls to the function.
+/// 
+/// This memoization layer prevents two repos which have different requirements
+/// on a common dependency from getting stuck in an infinite loop when they
+/// start `cloneOrFetch` concurrently.
+private var replayableClones: [GitURL: SignalProducer<(ProjectEvent?, URL), CarthageError>] = [:]
+
 /// Clones the given project to the given destination URL (defaults to the global
 /// repositories folder), or fetches inside it if it has already been cloned.
 /// Optionally takes a commitish to check for prior to fetching.
@@ -1544,7 +1554,10 @@ public func cloneOrFetch(
 			})
 		}
 		.flatMap(.merge) { (remoteURL: GitURL) -> SignalProducer<(ProjectEvent?, URL), CarthageError> in
-			return isGitRepository(repositoryURL)
+			if let previousFetch = replayableClones[remoteURL] {
+				return previousFetch
+			}
+			let fetch = isGitRepository(repositoryURL)
 				.flatMap(.merge) { isRepository -> SignalProducer<(ProjectEvent?, URL), CarthageError> in
 					if isRepository {
 						let fetchProducer: () -> SignalProducer<(ProjectEvent?, URL), CarthageError> = {
@@ -1588,5 +1601,8 @@ public func cloneOrFetch(
 							)
 					}
 				}
+				.replayLazily(upTo: 0)
+			replayableClones[remoteURL] = fetch
+			return fetch
 		}
 }
