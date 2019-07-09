@@ -4,6 +4,7 @@ import ReactiveSwift
 import Result
 
 import PackageModel
+import enum Workspace.ResolverDiagnostics
 import struct Basic.AnyError
 
 public struct PubgrubResolver: ResolverProtocol {
@@ -56,16 +57,21 @@ public struct PubgrubResolver: ResolverProtocol {
 
 	private func solve(dependencies: [DependencyContainer: VersionSpecifier]) -> SignalProducer<(Dependency, PinnedVersion), CarthageError> {
 
-		let project = ProjectContainer(dependencies: dependencies)
 		let provider = Provider(
-			project: ProjectContainer(dependencies: dependencies),
 			versionsForDependency: versionsForDependency,
 			dependenciesForDependency: dependenciesForDependency,
 			resolvedGitReference: resolvedGitReference
 		)
-		let resolver = PubgrubDependencyResolver(provider, nil, isPrefetchingEnabled: true, skipUpdate: false/* dependenciesToUpdate != nil */)
+		let resolver = DependencyResolver(provider, nil, isPrefetchingEnabled: true, skipUpdate: false/* dependenciesToUpdate != nil */)
 
-		let result = resolver.solve(root: project.identifier, pins: try! project.getUnversionedDependencies())
+		// TODO: support pins from Cartfile.resolved
+		let constraints = dependencies.map { dependency, VersionSpecifier in
+			PackageContainerConstraint(
+				container: dependency.identifier,
+				requirement: PackageRequirement.from(VersionSpecifier)
+			)
+		}
+		let result = resolver.resolve(dependencies: constraints, pins: [])
 
 		func pinnedDependency(for identifier: PackageReference, boundVersion: BoundVersion) -> SignalProducer<(Dependency, PinnedVersion), CarthageError> {
 			return SignalProducer(result: Dependency.from(packageReference: identifier).mapError(CarthageError.init))
@@ -96,38 +102,43 @@ public struct PubgrubResolver: ResolverProtocol {
 			return SignalProducer(bindings).flatMap(.concat, pinnedDependency)
 
 		case .unsatisfiable(let unsatisfiableDependencies, let unsatisfiablePins):
-			guard let identifier = unsatisfiableDependencies.first?.identifier else {
-					preconditionFailure()
-			}
 
-			let dependency = SignalProducer(result: Dependency.from(packageReference: identifier))
+			let diagnostics = ResolverDiagnostics.Unsatisfiable(dependencies: unsatisfiableDependencies, pins: unsatisfiablePins)
+			// TODO: try to make this an .incompatibleRequirements error. This may be tricky because the resolver
+			// doesn't seem to reveal the dependencies that contain the problematic versions.
+			return SignalProducer(error: .internalError(description: diagnostics.description))
 
-			let pins = SignalProducer(unsatisfiablePins)
-				.filter { $0.identifier == identifier }
-				.promoteError(ScannableError.self)
-				.attemptMap { (constraint: PackageContainerConstraint) -> Result<CarthageError.VersionRequirement, ScannableError> in
-					Dependency.from(packageReference: constraint.identifier)
-						.map { dependency in
-							(specifier: VersionSpecifier.from(constraint.requirement), fromDependency: dependency)
-						}
-				}
-				.collect(count: 2)
-
-			return dependency.zip(with: pins)
-				.mapError(CarthageError.init)
-				.flatMap(.concat) { dependency, pinnedRequirements in
-					SignalProducer(error: .incompatibleRequirements(dependency, pinnedRequirements[0], pinnedRequirements[1]))
-				}
+//			guard let identifier = unsatisfiableDependencies.first?.identifier else {
+//					preconditionFailure()
+//			}
+//
+//			let dependency = SignalProducer(result: Dependency.from(packageReference: identifier))
+//
+//			let pins = SignalProducer(unsatisfiablePins)
+//				.filter { $0.identifier == identifier }
+//				.promoteError(ScannableError.self)
+//				.attemptMap { (constraint: PackageContainerConstraint) -> Result<CarthageError.VersionRequirement, ScannableError> in
+//					Dependency.from(packageReference: constraint.identifier)
+//						.map { dependency in
+//							(specifier: VersionSpecifier.from(constraint.requirement), fromDependency: dependency)
+//						}
+//				}
+//				.collect(count: 2)
+//
+//			return dependency.zip(with: pins)
+//				.mapError(CarthageError.init)
+//				.flatMap(.concat) { dependency, pinnedRequirements in
+//					SignalProducer(error: .incompatibleRequirements(dependency, pinnedRequirements[0], pinnedRequirements[1]))
+//				}
 
 		case .error(let error):
-			return SignalProducer(error: .internalError(description: error.localizedDescription))
+			return SignalProducer(error: .internalError(description: String(describing: error)))
 		}
 	}
 }
 
 /// An object queried by SPM to determine available versions and dependencies of some dependency.
 private struct Provider: PackageContainerProvider {
-	let project: ProjectContainer
 	let versionsForDependency: (Dependency) -> SignalProducer<PinnedVersion, CarthageError>
 	let dependenciesForDependency: (Dependency, PinnedVersion) -> SignalProducer<(Dependency, VersionSpecifier), CarthageError>
 	let resolvedGitReference: (Dependency, String) -> SignalProducer<PinnedVersion, CarthageError>
@@ -136,8 +147,7 @@ private struct Provider: PackageContainerProvider {
 	)
 
 	func getContainer(for identifier: PackageReference, skipUpdate: Bool, completion: @escaping (SPMResult<PackageContainer, AnyError>) -> Void) {
-		let getProject = SignalProducer(value: project as PackageContainer).promoteError(CarthageError.self)
-		let getDependency = SignalProducer(result: Dependency.from(packageReference: identifier))
+		SignalProducer(result: Dependency.from(packageReference: identifier))
 			.mapError(CarthageError.init)
 			.observe(on: scheduler)
 			.flatMap(.concat) { dependency in
@@ -149,41 +159,16 @@ private struct Provider: PackageContainerProvider {
 				)
 			}
 			.map { $0 as PackageContainer }
-
-		let producer = identifier == project.identifier ? getProject : getDependency
-		producer.startWithResult { result in
-			switch result {
-			case .success(let container):
-				completion(.success(container))
-			case .failure(let error):
-				completion(.failure(AnyError(error)))
-			}
+			.startWithResult { result in
+				switch result {
+				case .success(let container):
+					completion(.success(container))
+				case .failure(let error):
+					completion(.failure(AnyError(error)))
+				}
 		}
 	}
 }
-
-#if false
-private class EncounteredDependencies {
-	let dependenciesForDependency: (Dependency, PinnedVersion) -> SignalProducer<(Dependency, VersionSpecifier), CarthageError>
-	var cache: [Dependency: VersionSpecifier] = [:]
-
-	init(dependenciesForDependency: @escaping (Dependency, PinnedVersion) -> SignalProducer<(Dependency, VersionSpecifier), CarthageError>) {
-		self.dependenciesForDependency = dependenciesForDependency
-	}
-
-	func dependenciesForVersion(of dependency: Dependency) -> (PinnedVersion) -> SignalProducer<(Dependency, VersionSpecifier), CarthageError> {
-		return { pinnedVersion in
-			self.dependenciesForDependency(dependency, pinnedVersion)
-				.on(value: { cache[$0] = $1 })
-		}
-	}
-
-	subscript(identifier: PackageReference) -> PackageContainer? {
-		get { return dependencies[identifier] }
-		set { dependencies[identifier] = newValue }
-	}
-}
-#endif
 
 
 // MARK: - Package container
@@ -192,7 +177,7 @@ private class EncounteredDependencies {
 /// facilitates bridging between SPM and Carthage.
 private struct DependencyContainer {
   let dependency: Dependency
-  let versions: [PinnedVersion: Version]
+  let versions: [Version]
   let pinnedVersions: [Version: PinnedVersion]
 
   let dependenciesForVersion: (PinnedVersion) -> SignalProducer<(Dependency, VersionSpecifier), CarthageError>
@@ -216,7 +201,7 @@ private struct DependencyContainer {
 				let reversedVersions = pairedVersions.map { ($1, $0) }
 				return DependencyContainer(
 					dependency: dependency,
-					versions: Dictionary(uniqueKeysWithValues: pairedVersions),
+					versions: pairedVersions.map({ $1 }).sorted(by: { $0 >= $1 }),
 					pinnedVersions: Dictionary(uniqueKeysWithValues: reversedVersions),
 					dependenciesForVersion: dependenciesForVersion,
 					resolvedGitReference: resolvedGitReference
@@ -240,7 +225,7 @@ extension DependencyContainer: PackageContainer {
 	}
 
   func versions(filter isIncluded: (Version) -> Bool) -> AnySequence<Version> {
-    return AnySequence(versions.values.filter(isIncluded))
+    return AnySequence(versions.filter(isIncluded))
   }
 
   func getDependencies(at version: Version) throws -> [PackageContainerConstraint] {
@@ -264,43 +249,6 @@ extension DependencyContainer: PackageContainer {
   func getUpdatedIdentifier(at boundVersion: BoundVersion) throws -> PackageReference {
     return identifier
   }
-}
-
-private struct ProjectContainer: PackageContainer {
-	let dependencies: [DependencyContainer: VersionSpecifier]
-
-	static var sharedIdentifier: PackageReference {
-		return PackageReference(identity: "project", path: ".")
-	}
-
-	var identifier: PackageReference {
-		return ProjectContainer.sharedIdentifier
-	}
-
-	func versions(filter isIncluded: (Version) -> Bool) -> AnySequence<Version> {
-		return AnySequence([Version(0, 0, 0)])
-	}
-
-	func getDependencies(at version: Version) throws -> [PackageContainerConstraint] {
-		fatalError("The ProjectContainer should always be unversioned")
-	}
-
-	func getDependencies(at revision: String) throws -> [PackageContainerConstraint] {
-		fatalError("The ProjectContainer should always be unversioned")
-	}
-
-	func getUnversionedDependencies() throws -> [PackageContainerConstraint] {
-		return dependencies.map { container, versionSpecifier in
-			PackageContainerConstraint(
-				container: container.identifier,
-				requirement: PackageRequirement.from(versionSpecifier)
-			)
-		}
-	}
-
-	func getUpdatedIdentifier(at boundVersion: BoundVersion) throws -> PackageReference {
-		return identifier
-	}
 }
 
 extension DependencyContainer: Hashable {
@@ -327,7 +275,6 @@ private extension PackageRequirement {
 		case .any:
 			return .versionSet(.any)
 		case .atLeast(let version):
-
 			return .versionSet(.range(version..<maximumVersion))
 		case .compatibleWith(let version):
 			let nextMajor = Version(version.major + 1, 0, 0)
