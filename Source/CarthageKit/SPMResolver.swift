@@ -7,14 +7,11 @@ import PackageModel
 import enum Workspace.ResolverDiagnostics
 import struct Basic.AnyError
 
-public struct PubgrubResolver: ResolverProtocol {
+public struct SPMResolver: ResolverProtocol {
 
   private let versionsForDependency: (Dependency) -> SignalProducer<PinnedVersion, CarthageError>
   private let dependenciesForDependency: (Dependency, PinnedVersion) -> SignalProducer<(Dependency, VersionSpecifier), CarthageError>
   private let resolvedGitReference: (Dependency, String) -> SignalProducer<PinnedVersion, CarthageError>
-	private let scheduler = QueueScheduler(
-		targeting: DispatchQueue(label: "org.carthage.CarthageKit.PubgrubResolver.getContainer", attributes: .concurrent)
-	)
 
   public init(
     versionsForDependency: @escaping (Dependency) -> SignalProducer<PinnedVersion, CarthageError>,
@@ -143,7 +140,7 @@ private struct Provider: PackageContainerProvider {
 	let dependenciesForDependency: (Dependency, PinnedVersion) -> SignalProducer<(Dependency, VersionSpecifier), CarthageError>
 	let resolvedGitReference: (Dependency, String) -> SignalProducer<PinnedVersion, CarthageError>
 	let scheduler = QueueScheduler(
-		targeting: DispatchQueue(label: "org.carthage.CarthageKit.PubgrubResolver.getContainer", attributes: .concurrent)
+		targeting: DispatchQueue(label: "org.carthage.CarthageKit.SPMResolver.getContainer", attributes: .concurrent)
 	)
 
 	func getContainer(for identifier: PackageReference, skipUpdate: Bool, completion: @escaping (SPMResult<PackageContainer, AnyError>) -> Void) {
