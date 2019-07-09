@@ -35,6 +35,7 @@ class ResolverSpec: QuickSpec {
 	override func spec() {
 		itBehavesLike(ResolverBehavior.self) { () in Resolver.self }
 		itBehavesLike(ResolverBehavior.self) { () in NewResolver.self }
+    itBehavesLike(ResolverBehavior.self) { () in PubgrubResolver.self }
 	}
 }
 
