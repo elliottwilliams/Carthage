@@ -35,6 +35,7 @@ class ResolverSpec: QuickSpec {
 	override func spec() {
 		itBehavesLike(ResolverBehavior.self) { () in Resolver.self }
 		itBehavesLike(ResolverBehavior.self) { () in NewResolver.self }
+    itBehavesLike(ResolverBehavior.self) { () in SPMResolver.self }
 	}
 }
 
@@ -302,7 +303,7 @@ class ResolverBehavior: Behavior<ResolverProtocol.Type> {
 				]
 
 				let resolved = db.resolve(resolverType, [ github1: .any, github2: .any ])
-				expect(resolved.value!) == [
+				expect(resolved.value) == [
 					github3: PinnedVersion(sha),
 					github2: .v1_0_0,
 					github1: .v1_0_0,
