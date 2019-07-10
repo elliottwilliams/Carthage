@@ -8,6 +8,7 @@ import enum Workspace.ResolverDiagnostics
 import struct Basic.AnyError
 
 public struct SPMResolver: ResolverProtocol {
+  private typealias VersionedContainers = (dependencies: [(DependencyContainer, VersionSpecifier)], pins: [(DependencyContainer, VersionSpecifier)])
 
   private let versionsForDependency: (Dependency) -> SignalProducer<PinnedVersion, CarthageError>
   private let dependenciesForDependency: (Dependency, PinnedVersion) -> SignalProducer<(Dependency, VersionSpecifier), CarthageError>
@@ -31,29 +32,104 @@ public struct SPMResolver: ResolverProtocol {
 		dependenciesToUpdate: [String]?
 	) -> SignalProducer<[Dependency : PinnedVersion], CarthageError> {
 
-		return SignalProducer(dependencies)
-			.flatMap(.merge) { dependency, versionSpecifier -> SignalProducer<(DependencyContainer, VersionSpecifier), CarthageError> in
-				DependencyContainer.from(
-					dependency: dependency,
-					pinnedVersions: self.versionsForDependency(dependency),
-					dependenciesForVersion: { pinnedVersion in self.dependenciesForDependency(dependency, pinnedVersion) },
-					resolvedGitReference: { revision in self.resolvedGitReference(dependency, revision) }
-					).map { container in
-						(container, versionSpecifier)
-				}
-			}
-			.collect()
-			.flatMap(.concat) { dependencyVersionPairs -> SignalProducer<[Dependency : PinnedVersion], CarthageError> in
-				let loadedDependencies = Dictionary(uniqueKeysWithValues: dependencyVersionPairs)
-				return self.solve(dependencies: loadedDependencies)
-					.collect()
-					.map(Dictionary.init(uniqueKeysWithValues:))
-				}
-		// TODO: additional filtering using `lastResolved` and `dependenciesToUpdate`
+    /*
+     When dependenciesToUpdate is nonempty, the resolver needs to _only_ update a dependency to a new version
+     _if_ its name or one of its parents' names appear in dependenciesToUpdate.
+
+     This must be done after resolution, because in order to get dependencies of dependencies we need pinned
+     versions from the resolver. This is consistent with how the stock Resolver works, though---it performs
+     a full resolution, and
+     */
+
+    typealias Partition<T> = (pins: Set<T>, updates: Set<T>) where T: Hashable
+
+    let partitionProducer: SignalProducer<Partition<Dependency>, CarthageError>
+
+    if let lastResolved = lastResolved, let dependenciesToUpdate = dependenciesToUpdate, !dependenciesToUpdate.isEmpty {
+//      let currentDependencies = Set(dependencies.keys)
+//      let resolvedIntersection = lastResolved.filter { dependency, _ in currentDependencies.contains(dependency) }
+      partitionProducer = dependenciesForUpdating(given: lastResolved, dependenciesToUpdate: dependenciesToUpdate)
+        .map { dependenciesToPin -> Partition<Dependency> in
+          (
+            pins: Set(dependenciesToPin.filter({ _, shouldUpdate in !shouldUpdate }).map({ dependency, _ in dependency })),
+            updates: Set(dependenciesToPin.filter({ _, shouldUpdate in shouldUpdate }).map({ dependency, _ in dependency }))
+          )
+      }
+    } else {
+      partitionProducer = SignalProducer(value: (
+        pins: [],
+        updates: Set(dependencies.keys)
+      ))
+    }
+
+    return partitionProducer.flatMap(.concat) { partition -> SignalProducer<[Dependency : PinnedVersion], CarthageError> in
+      // TODO: separate fn
+
+      let dependencies = SignalProducer(dependencies)
+        .filter { dependency, _ in
+          partition.updates.contains(dependency)
+        }
+        .flatMap(.merge) { dependency, versionSpecifier -> SignalProducer<(DependencyContainer, VersionSpecifier), CarthageError> in
+          self.container(for: dependency).map { container in (container, versionSpecifier) }
+        }
+        .map(PackageContainerConstraint.init)
+        .collect()
+
+      let pins = SignalProducer(lastResolved ?? [:])
+        .filter { dependency, _ in
+          partition.pins.contains(dependency)
+        }
+        .flatMap(.merge) { dependency, pinnedVersion -> SignalProducer<(DependencyContainer, VersionSpecifier), CarthageError> in
+          let versionSpecifier = Version.from(pinnedVersion).mapError(CarthageError.init).map(VersionSpecifier.exactly)
+          return self.container(for: dependency).zip(with: SignalProducer(result: versionSpecifier))
+        }
+        .map(PackageContainerConstraint.init)
+        .collect()
+
+
+      return dependencies.zip(with: pins).flatMap(.concat) { dependencies, pins in
+        self.solve(dependencies: dependencies, pins: pins)
+          .collect()
+          .map(Dictionary.init(uniqueKeysWithValues:))
+      }
+
+
+    }
 	}
 
-	private func solve(dependencies: [DependencyContainer: VersionSpecifier]) -> SignalProducer<(Dependency, PinnedVersion), CarthageError> {
+  private func dependenciesForUpdating(given resolvedDependencies: [Dependency: PinnedVersion],
+                                       dependenciesToUpdate: [String]) -> SignalProducer<[Dependency: Bool], CarthageError> {
 
+    func rec(resolvedDependencies: [Dependency: PinnedVersion],
+             shouldUpdateDependencyWithName: @escaping (String) -> Bool) -> SignalProducer<(Dependency, Bool), CarthageError> {
+
+      return SignalProducer(resolvedDependencies)
+        .flatMap(.concat) { dependency, pinnedVersion -> SignalProducer<(Dependency, Bool), CarthageError> in
+          guard shouldUpdateDependencyWithName(dependency.name) else {
+            return SignalProducer(value: (dependency, false))
+          }
+
+          let subdependenciesForUpdating = self.dependenciesForDependency(dependency, pinnedVersion)
+            .map { subdependency, _ in
+              (subdependency, resolvedDependencies[subdependency]!)
+            }
+            .collect()
+            .map(Dictionary.init(uniqueKeysWithValues:))
+            .flatMap(.concat) { resolvedSubdependencies in
+              rec(resolvedDependencies: resolvedSubdependencies, shouldUpdateDependencyWithName: { _ in true })
+          }
+
+          return SignalProducer(value: (dependency, true)).concat(subdependenciesForUpdating)
+      }
+    }
+
+    return rec(resolvedDependencies: resolvedDependencies,
+               shouldUpdateDependencyWithName: dependenciesToUpdate.contains)
+      .collect()
+      .map { Dictionary($0, uniquingKeysWith: { $0 || $1 }) }
+  }
+
+  private func solve(dependencies: [PackageContainerConstraint], pins: [PackageContainerConstraint]) -> SignalProducer<(Dependency, PinnedVersion), CarthageError> {
 		let provider = Provider(
 			versionsForDependency: versionsForDependency,
 			dependenciesForDependency: dependenciesForDependency,
@@ -61,14 +137,10 @@ public struct SPMResolver: ResolverProtocol {
 		)
 		let resolver = DependencyResolver(provider, nil, isPrefetchingEnabled: true, skipUpdate: false/* dependenciesToUpdate != nil */)
 
-		// TODO: support pins from Cartfile.resolved
-		let constraints = dependencies.map { dependency, VersionSpecifier in
-			PackageContainerConstraint(
-				container: dependency.identifier,
-				requirement: PackageRequirement.from(VersionSpecifier)
-			)
-		}
-		let result = resolver.resolve(dependencies: constraints, pins: [])
+		let result = resolver.resolve(
+      dependencies: dependencies,
+      pins: pins
+    )
 
 		func pinnedDependency(for identifier: PackageReference, boundVersion: BoundVersion) -> SignalProducer<(Dependency, PinnedVersion), CarthageError> {
 			return SignalProducer(result: Dependency.from(packageReference: identifier).mapError(CarthageError.init))
@@ -132,6 +204,25 @@ public struct SPMResolver: ResolverProtocol {
 			return SignalProducer(error: .internalError(description: String(describing: error)))
 		}
 	}
+
+  private func pinnedConstraints(for lastResolved: [Dependency: PinnedVersion], excluding dependenciesToUpdate: [String]) -> SignalProducer<[PackageContainerConstraint], CarthageError> {
+    return SignalProducer(lastResolved)
+      .filter { dependency, _ in !dependenciesToUpdate.contains(dependency.name) }
+      .flatMap(.merge) { dependency, pinnedVersion -> SignalProducer<(DependencyContainer, VersionSpecifier), CarthageError> in
+        let versionSpecifier = Version.from(pinnedVersion).mapError(CarthageError.init).map(VersionSpecifier.exactly)
+        return self.container(for: dependency).zip(with: SignalProducer(result: versionSpecifier))
+      }
+      .map(PackageContainerConstraint.init).collect()
+  }
+
+  private func container(for dependency: Dependency) -> SignalProducer<DependencyContainer, CarthageError> {
+    return DependencyContainer.from(
+      dependency: dependency,
+      pinnedVersions: self.versionsForDependency(dependency),
+      dependenciesForVersion: { pinnedVersion in self.dependenciesForDependency(dependency, pinnedVersion) },
+      resolvedGitReference: { revision in self.resolvedGitReference(dependency, revision) }
+    )
+  }
 }
 
 /// An object queried by SPM to determine available versions and dependencies of some dependency.
@@ -334,4 +425,11 @@ extension SPMResult {
 			return .success(success)
 		}
 	}
+}
+
+private extension PackageContainerConstraint {
+  init(_ pair: (DependencyContainer, VersionSpecifier)) {
+    let (package, pinnedVersion) = pair
+    self.init(container: package.identifier, requirement: PackageRequirement.from(pinnedVersion))
+  }
 }
