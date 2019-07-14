@@ -12,7 +12,7 @@ public struct UpdateCommand: CommandProtocol {
 		public let buildAfterUpdate: Bool
 		public let isVerbose: Bool
 		public let logPath: String?
-		public let useNewResolver: Bool
+    public let resolverOptions: ResolverOptions
 		public let buildOptions: CarthageKit.BuildOptions
 		public let checkoutOptions: CheckoutCommand.Options
 		public let dependenciesToUpdate: [String]?
@@ -47,7 +47,7 @@ public struct UpdateCommand: CommandProtocol {
 		             buildAfterUpdate: Bool,
 		             isVerbose: Bool,
 		             logPath: String?,
-		             useNewResolver: Bool,
+                 resolverOptions: ResolverOptions,
 		             buildOptions: BuildOptions,
 		             checkoutOptions: CheckoutCommand.Options
 		) {
@@ -55,7 +55,7 @@ public struct UpdateCommand: CommandProtocol {
 			self.buildAfterUpdate = buildAfterUpdate
 			self.isVerbose = isVerbose
 			self.logPath = logPath
-			self.useNewResolver = useNewResolver
+			self.resolverOptions = resolverOptions
 			self.buildOptions = buildOptions
 			self.checkoutOptions = checkoutOptions
 			self.dependenciesToUpdate = checkoutOptions.dependenciesToCheckout
@@ -71,7 +71,7 @@ public struct UpdateCommand: CommandProtocol {
 				<*> mode <| Option(key: "build", defaultValue: true, usage: buildDescription)
 				<*> mode <| Option(key: "verbose", defaultValue: false, usage: "print xcodebuild output inline (ignored if --no-build option is present)")
 				<*> mode <| Option(key: "log-path", defaultValue: nil, usage: "path to the xcode build output. A temporary file is used by default")
-				<*> mode <| Option(key: "new-resolver", defaultValue: false, usage: "use the new resolver codeline when calculating dependencies. Default is false")
+				<*> ResolverOptions.evaluate(mode)
 				<*> BuildOptions.evaluate(mode, addendum: "\n(ignored if --no-build option is present)")
 				<*> CheckoutCommand.Options.evaluate(mode, dependenciesUsage: dependenciesUsage)
 		}
@@ -108,7 +108,9 @@ public struct UpdateCommand: CommandProtocol {
 				}
 
 				let updateDependencies = project.updateDependencies(
-					shouldCheckout: options.checkoutAfterUpdate, useNewResolver: options.useNewResolver, buildOptions: options.buildOptions,
+					shouldCheckout: options.checkoutAfterUpdate,
+          resolverType: options.resolverOptions.resolverType,
+          buildOptions: options.buildOptions,
 					dependenciesToUpdate: options.dependenciesToUpdate
 				)
 
@@ -117,4 +119,32 @@ public struct UpdateCommand: CommandProtocol {
 			.then(options.buildProducer)
 			.waitOnCommand()
 	}
+}
+
+public struct ResolverOptions: OptionsProtocol {
+  let useNewResolver: Bool
+  let useSPMResolver: Bool
+
+  public var resolverType: ResolverProtocol.Type {
+    if useNewResolver {
+      return NewResolver.self
+    } else if useSPMResolver {
+      return SPMResolver.self
+    } else {
+      return Resolver.self
+    }
+  }
+
+  public static func evaluate(_ mode: CommandMode) -> Result<ResolverOptions, CommandantError<CarthageError>> {
+    let options: Result<ResolverOptions, CommandantError<CarthageError>> = curry(ResolverOptions.init)
+      <*> mode <| Option(key: "new-resolver", defaultValue: false, usage: "use the new resolver codeline when calculating dependencies. Default is false")
+      <*> mode <| Option(key: "spm-resolver", defaultValue: false, usage: "use the swift package manager's resolver when calculating dependencies. Default is false")
+
+    return options.flatMap { options in
+      guard !(options.useNewResolver && options.useSPMResolver) else {
+        return .failure(.usageError(description: "--new-resolver and --spm-resolver are mutually exclusive"))
+      }
+      return .success(options)
+    }
+  }
 }
