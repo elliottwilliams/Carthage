@@ -51,6 +51,7 @@ public struct OutdatedCommand: CommandProtocol {
 		public let useSSH: Bool
 		public let isVerbose: Bool
 		public let outputXcodeWarnings: Bool
+    public let resolverOptions: ResolverOptions
 		public let colorOptions: ColorOptions
 		public let directoryPath: String
 
@@ -65,6 +66,7 @@ public struct OutdatedCommand: CommandProtocol {
 				<*> mode <| Option(key: "use-ssh", defaultValue: false, usage: "use SSH for downloading GitHub repositories")
 				<*> mode <| Option(key: "verbose", defaultValue: false, usage: "include nested dependencies")
 				<*> mode <| Option(key: "xcode-warnings", defaultValue: false, usage: "output Xcode compatible warning messages")
+        <*> ResolverOptions.evaluate(mode)
 				<*> ColorOptions.evaluate(mode, additionalUsage: UpdateType.legend)
 				<*> mode <| projectDirectoryOption
 		}
@@ -88,7 +90,7 @@ public struct OutdatedCommand: CommandProtocol {
 
 	public func run(_ options: Options) -> Result<(), CarthageError> {
 		return options.loadProject()
-			.flatMap(.merge) { $0.outdatedDependencies(options.isVerbose) }
+      .flatMap(.merge) { $0.outdatedDependencies(options.isVerbose, resolverType: options.resolverOptions.resolverType) }
 			.on(value: { outdatedDependencies in
 				let formatting = options.colorOptions.formatting
 
