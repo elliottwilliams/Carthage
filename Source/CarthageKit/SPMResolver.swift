@@ -13,6 +13,9 @@ public struct SPMResolver: ResolverProtocol {
   private let dependenciesForDependency: (Dependency, PinnedVersion) -> SignalProducer<(Dependency, VersionSpecifier), CarthageError>
   private let resolvedGitReference: (Dependency, String) -> SignalProducer<PinnedVersion, CarthageError>
 
+  /// The resolver starts on this queue (although container fetches are performed on the `Provider`'s concurrent scheduler).
+  private let resolverQueue = QueueScheduler(name: "org.carthage.CarthageKit.SPMResolver")
+
   public init(
     versionsForDependency: @escaping (Dependency) -> SignalProducer<PinnedVersion, CarthageError>,
     dependenciesForDependency: @escaping (Dependency, PinnedVersion) -> SignalProducer<(Dependency, VersionSpecifier), CarthageError>,
@@ -58,6 +61,7 @@ public struct SPMResolver: ResolverProtocol {
     // Using package constraints for the Cartfile dependencies and pins based on dependenciesToUpdate...
     return constraints(for: dependenciesProducer).combineLatest(with: constraints(for: pinsProducer))
       // call the solver...
+      .observe(on: resolverQueue)
       .flatMap(.concat, solve)
       // convert SPM's binding type into (Dependency, PinnedVersion)...
       .flatMap(.concat, pinnedDependency)
@@ -205,12 +209,12 @@ private struct Provider: PackageContainerProvider {
 
 	func getContainer(for identifier: PackageReference, skipUpdate: Bool, completion: @escaping (SPMResult<PackageContainer, AnyError>) -> Void) {
 		SignalProducer(result: Dependency.from(packageReference: identifier))
+      .observe(on: self.scheduler)
 			.mapError(CarthageError.init)
-			.observe(on: scheduler)
 			.flatMap(.concat) { dependency in
 				DependencyContainer.from(
 					dependency: dependency,
-					pinnedVersions: self.versionsForDependency(dependency),
+          pinnedVersions: self.versionsForDependency(dependency),
 					dependenciesForVersion: { pinnedVersion in self.dependenciesForDependency(dependency, pinnedVersion) },
 					resolvedGitReference: { ref in self.resolvedGitReference(dependency, ref) }
 				)
@@ -250,16 +254,18 @@ private struct DependencyContainer {
 		return pinnedVersions
 			.attemptMap { pinnedVersion in
 				Version.from(pinnedVersion)
-					.map { (pinnedVersion, $0) }
+					.map { ($0, pinnedVersion) }
 					.mapError(CarthageError.init)
 			}
-			.collect()
-			.map { pairedVersions in
-				let reversedVersions = pairedVersions.map { ($1, $0) }
+      .reduce(into: [Version: PinnedVersion]()) { pinnedVersionForVersion, pair in
+        let (version, pinnedVersion) = pair
+        pinnedVersionForVersion[version] = pinnedVersion
+      }
+			.map { pinnedVersionForVersion in
 				return DependencyContainer(
 					dependency: dependency,
-					versions: pairedVersions.map({ $1 }).sorted(by: { $0 >= $1 }),
-					pinnedVersions: Dictionary(uniqueKeysWithValues: reversedVersions),
+					versions: pinnedVersionForVersion.keys.sorted(by: { $0 >= $1 }),
+					pinnedVersions: pinnedVersionForVersion,
 					dependenciesForVersion: dependenciesForVersion,
 					resolvedGitReference: resolvedGitReference
 				)
