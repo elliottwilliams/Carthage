@@ -132,6 +132,17 @@ public final class Project { // swiftlint:disable:this type_body_length
 	private lazy var xcodeVersionDirectory: String = XcodeVersion.make()
 		.map { "\($0.version)_\($0.buildVersion)" } ?? "Unknown"
 
+	struct Diagnostics {
+		var tagLookups = 0
+		var versionFetches = 0
+		var cartfileFetches = 0
+	}
+	var diagnostics = Diagnostics()
+
+	deinit {
+		print(diagnostics)
+	}
+
 	/// Attempts to load Cartfile or Cartfile.private from the given directory,
 	/// merging their dependencies.
 	public func loadCombinedCartfile() -> SignalProducer<Cartfile, CarthageError> {
@@ -276,6 +287,7 @@ public final class Project { // swiftlint:disable:this type_body_length
 					return SignalProducer(versions)
 				} else {
 					return fetchVersions
+						.on(started: { self.diagnostics.versionFetches += 1 })
 						.collect()
 						.on(value: { newVersions in
 							self.cachedVersions[dependency] = newVersions
@@ -324,6 +336,7 @@ public final class Project { // swiftlint:disable:this type_body_length
 				}
 				.flatMapError { _ in .empty }
 				.attemptMap(Cartfile.from(string:))
+				.on(started: { self.diagnostics.cartfileFetches += 1 })
 
 			let cartfileSource: SignalProducer<Cartfile, CarthageError>
 			if tryCheckoutDirectory {
@@ -409,6 +422,7 @@ public final class Project { // swiftlint:disable:this type_body_length
 		return cloneOrFetchDependency(dependency, commitish: reference)
 			.flatMap(.concat) { _ in
 				return resolveTagInRepository(repositoryURL, reference)
+					.on(started: { self.diagnostics.tagLookups += 1 })
 					.map { _ in
 						// If the reference is an exact tag, resolves it to the tag.
 						return PinnedVersion(reference)
@@ -557,6 +571,9 @@ public final class Project { // swiftlint:disable:this type_body_length
 				return self.writeResolvedCartfile(resolvedCartfile)
 			}
 			.then(shouldCheckout ? checkoutResolvedDependencies(dependenciesToUpdate, buildOptions: buildOptions) : .empty)
+			.on(completed: {
+				print(self.diagnostics)
+			})
 	}
 
 	/// Constructs the file:// URL at which a given .framework
