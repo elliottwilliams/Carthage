@@ -84,17 +84,22 @@ public struct SPMResolver: ResolverProtocol {
 			.filter { dependency, _ in dependencyNamesToUpdate.contains(dependency.name) }
 
 		/// Sends all nested dependencies of `dependency`, using versions from `resolvedDependencies`.
-		func subtree(for dependency: Dependency,
-								 at pinnedVersion: PinnedVersion) -> SignalProducer<(Dependency, PinnedVersion), CarthageError> {
+		func subtree(
+			for dependency: Dependency,
+			at pinnedVersion: PinnedVersion,
+			visited: Set<Dependency>
+		) -> SignalProducer<(Dependency, PinnedVersion), CarthageError> {
+			print("subtree(for:", dependency, "at:", pinnedVersion, "visited:", visited, ")")
 			return self.dependenciesForDependency(dependency, pinnedVersion)
-				// TODO: cycle detection?
-				.map { dependency, _ in (dependency, resolvedDependencies[dependency]!) }
+				.filter { dependency, _ in !visited.contains(dependency) }
+				.map { dependency, _ in (dependency, resolvedDependencies[dependency]!, visited.union([dependency])) }
 				.flatMap(.concat, subtree)
 				.concat(SignalProducer(value: (dependency, pinnedVersion)))
 		}
 
 		// Add subdependencies to that set, recursively
-		let dependenciesToFilterOut = SignalProducer(dependenciesToUpdate).flatMap(.concat, subtree)
+		let dependenciesToFilterOut = SignalProducer(dependenciesToUpdate)
+			.flatMap(.concat) { subtree(for: $0, at: $1, visited: []) }
 			.reduce(into: Set<Dependency>()) { set, pair in
 				let (dependency, _) = pair
 				set.insert(dependency)
@@ -246,13 +251,30 @@ private struct Provider: PackageContainerProvider {
 
 /// Represents a dependency, its available versions, and their corresponding git references. g
 /// facilitates bridging between SPM and Carthage.
-private struct DependencyContainer {
+private class DependencyContainer {
 	let dependency: Dependency
 	let versions: [Version]
 	let pinnedVersions: [Version: PinnedVersion]
 
 	let dependenciesForVersion: (PinnedVersion) -> SignalProducer<(Dependency, VersionSpecifier), CarthageError>
 	let resolvedGitReference: (String) -> SignalProducer<PinnedVersion, CarthageError>
+
+	var cachedDependenciesForVersion: [Version: [PackageContainerConstraint]] = [:]
+	var cachedDependenciesForRevision: [String: [PackageContainerConstraint]] = [:]
+
+	private init(
+		dependency: Dependency,
+		versions: [Version],
+		pinnedVersions: [Version: PinnedVersion],
+		dependenciesForVersion: @escaping (PinnedVersion) -> SignalProducer<(Dependency, VersionSpecifier), CarthageError>,
+		resolvedGitReference: @escaping (String) -> SignalProducer<PinnedVersion, CarthageError>
+	) {
+		self.dependency = dependency
+		self.versions = versions
+		self.pinnedVersions = pinnedVersions
+		self.dependenciesForVersion = dependenciesForVersion
+		self.resolvedGitReference = resolvedGitReference
+	}
 
 	static func from(
 		dependency: Dependency,
@@ -302,17 +324,28 @@ extension DependencyContainer: PackageContainer {
 	}
 
 	func getDependencies(at version: Version) throws -> [PackageContainerConstraint] {
+		if let cachedDependencies = cachedDependenciesForVersion[version] {
+			return cachedDependencies
+		}
+
 		guard let pinnedVersion = pinnedVersions[version] else {
 			preconditionFailure()
 		}
 
-		return try constraints(at: pinnedVersion)
-			.collect().first()?.get() ?? []
+		let dependencies = try constraints(at: pinnedVersion).collect().first()?.get() ?? []
+		cachedDependenciesForVersion[version] = dependencies
+		return dependencies
 	}
 
 	func getDependencies(at revision: String) throws -> [PackageContainerConstraint] {
-		return try resolvedGitReference(revision).flatMap(.concat, constraints(at:))
-			.collect().first()?.get() ?? []
+		if let cachedDependencies = cachedDependenciesForRevision[revision] {
+			return cachedDependencies
+		}
+
+		let dependencies = try resolvedGitReference(revision)
+			.flatMap(.concat, constraints(at:)).collect().first()?.get() ?? []
+		cachedDependenciesForRevision[revision] = dependencies
+		return dependencies
 	}
 
 	func getUnversionedDependencies() throws -> [PackageContainerConstraint] {
