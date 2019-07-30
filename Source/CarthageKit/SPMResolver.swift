@@ -349,7 +349,8 @@ extension DependencyContainer: PackageContainer {
 	}
 
 	func getUnversionedDependencies() throws -> [PackageContainerConstraint] {
-		fatalError("All dependencies are versioned")
+    // Carthage doesn't have a concept of unversioned dependencies, but this may be called by the constraint debugger.
+    return []
 	}
 
 	func getUpdatedIdentifier(at boundVersion: BoundVersion) throws -> PackageReference {
