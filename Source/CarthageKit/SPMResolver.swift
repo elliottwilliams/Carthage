@@ -284,10 +284,10 @@ private class DependencyContainer {
 	) -> SignalProducer<DependencyContainer, CarthageError> {
 
 		return pinnedVersions
-			.attemptMap { pinnedVersion in
+			.filterMap { pinnedVersion in
 				Version.from(pinnedVersion)
 					.map { ($0, pinnedVersion) }
-					.mapError(CarthageError.init)
+					.value
 			}
 			.reduce(into: [Version: PinnedVersion]()) { pinnedVersionForVersion, pair in
 				let (version, pinnedVersion) = pair
