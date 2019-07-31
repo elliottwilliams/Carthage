@@ -47,7 +47,7 @@ public struct CopyFrameworksCommand: CommandProtocol {
 }
 
 private func copyFramework(_ source: URL, target: URL, validArchitectures: [String]) -> SignalProducer<(), CarthageError> {
-	return SignalProducer.combineLatest(copyProduct(source, target), codeSigningIdentity())
+	return SignalProducer.combineLatest(copyProduct(source.resolvingSymlinksInPath(), target.resolvingSymlinksInPath()), codeSigningIdentity())
 		.flatMap(.merge) { url, codesigningIdentity -> SignalProducer<(), CarthageError> in
 			let strip = stripFramework(
 				url,
