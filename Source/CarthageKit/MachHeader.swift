@@ -9,31 +9,31 @@ import Result
 /// Provides a unified structure for
 /// `MachO.loader.mach_header` and `MachO.loader.mach_header_64`
 
-struct MachHeader {
+public struct MachHeader {
 
-	enum Endianness {
+	public enum Endianness {
 		case little
 		case big
 	}
 
-	let magic: UInt32
-	let cpuType: cpu_type_t
-	let cpuSubtype: cpu_type_t
-	let fileType: UInt32
-	let ncmds: UInt32
-	let sizeofcmds: UInt32
-	let flags: UInt32
-	let reserved: UInt32?
+	public let magic: UInt32
+	public let cpuType: cpu_type_t
+	public let cpuSubtype: cpu_type_t
+	public let fileType: UInt32
+	public let ncmds: UInt32
+	public let sizeofcmds: UInt32
+	public let flags: UInt32
+	public let reserved: UInt32?
 
-	var is64BitHeader: Bool {
+	public var is64BitHeader: Bool {
 		return magic == MH_MAGIC_64 || magic == MH_CIGAM_64
 	}
 
-	var is32BitHeader: Bool {
+	public var is32BitHeader: Bool {
 		return !is64BitHeader
 	}
 
-	var endianess: Endianness {
+	public var endianess: Endianness {
 		return magic == MH_CIGAM_64 || magic == MH_CIGAM ? .big : .little
 	}
 }
@@ -62,7 +62,7 @@ extension MachHeader {
 	///            0xfeedfacf 16777223          3  0x00           1     8       1720 0x00002000
 	///
 	/// - See Also:  [LLVM MachODump.cpp](https://llvm.org/viewvc/llvm-project/llvm/trunk/tools/llvm-objdump/MachODump.cpp?view=markup&pathrev=225383###see%C2%B7line%C2%B72745)
-	static func headers(forMachOFileAtUrl url: URL) -> SignalProducer<MachHeader, CarthageError> {
+	public static func headers(forMachOFileAtUrl url: URL) -> SignalProducer<MachHeader, CarthageError> {
 
 		// This is the command `otool -h` actually invokes
 		let task = Task("/usr/bin/xcrun", arguments: [

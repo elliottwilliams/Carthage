@@ -66,7 +66,7 @@ private func copyFramework(_ source: URL, target: URL, validArchitectures: [Stri
 }
 
 private func shouldIgnoreFramework(_ framework: URL, validArchitectures: [String]) -> SignalProducer<Bool, CarthageError> {
-	return architecturesInPackage(framework)
+	let hasValidArchitecture = architecturesInPackage(framework)
 		.collect()
 		.map { architectures in
 			// Return all the architectures, present in the framework, that are valid.
@@ -77,6 +77,13 @@ private func shouldIgnoreFramework(_ framework: URL, validArchitectures: [String
 			// wat means that the framework does not have a binary for the given architecture, ignore the framework.
 			remainingArchitectures.isEmpty
 		}
+  let isStatic = SignalProducer(result: binaryURL(framework))
+    .flatMap(.concat, MachHeader.headers(forMachOFileAtUrl:))
+    .take(first: 1)
+    .map { header in
+      header.fileType == MH_OBJECT
+    }
+  return hasValidArchitecture.or(isStatic)
 }
 
 private func copyDebugSymbolsForFramework(_ source: URL, validArchitectures: [String]) -> SignalProducer<(), CarthageError> {
