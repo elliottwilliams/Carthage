@@ -131,7 +131,7 @@ public struct ResolverOptions: OptionsProtocol {
     } else if useSPMResolver {
       return SPMResolver.self
     } else {
-      return Resolver.self
+      return SPMResolver.self
     }
   }
 
