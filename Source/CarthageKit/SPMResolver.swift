@@ -6,6 +6,10 @@ import Result
 import enum Workspace.ResolverDiagnostics
 import struct Basic.AnyError
 
+
+extension Dependency: PackageContainerIdentifier {}
+private typealias Constraint = PackageContainerConstraint<Dependency>
+
 public struct SPMResolver: ResolverProtocol {
 	private typealias VersionedContainers = (dependencies: [(DependencyContainer, VersionSpecifier)], pins: [(DependencyContainer, VersionSpecifier)])
 
@@ -131,11 +135,9 @@ public struct SPMResolver: ResolverProtocol {
 	// MARK: - Lower half: SPM bridging
 
 	/// Converts dependency requirements to package constraints.
-	///
-	/// This involves creating a package container, which loads all available versions of a dependency.
 	private func constraints(
 		for dependencies: SignalProducer<[Dependency: VersionSpecifier], CarthageError>
-	) -> SignalProducer<[PackageContainerConstraint], CarthageError> {
+	) -> SignalProducer<[Constraint], CarthageError> {
 		return dependencies
 			// Convert the dictionary producer to a key-value producer
 			.flatMap(.concat, SignalProducer.init)
@@ -148,30 +150,19 @@ public struct SPMResolver: ResolverProtocol {
 					return SignalProducer(value: (dependency, versionSpecifier))
 				}
 			}
-			// Convert each Dependency to a DependencyContainer
-			.flatMap(.concat) { dependency, versionSpecifier -> SignalProducer<(DependencyContainer, VersionSpecifier), CarthageError> in
-				self.container(for: dependency).map { container in (container, versionSpecifier) }
+			// Convert each Dependency to a constraint.
+			.map { dependency, versionSpecifier -> Constraint in
+        Constraint(container: dependency, requirement: PackageRequirement.from(versionSpecifier))
 			}
-			.map(PackageContainerConstraint.init)
 			.collect()
-	}
-
-	/// Sends a `PackageContainer` which wraps the dependency after loading its versions.
-	private func container(for dependency: Dependency) -> SignalProducer<DependencyContainer, CarthageError> {
-		return DependencyContainer.from(
-			dependency: dependency,
-			pinnedVersions: self.versionsForDependency(dependency),
-			dependenciesForVersion: { pinnedVersion in self.dependenciesForDependency(dependency, pinnedVersion) },
-			resolvedGitReference: self.resolvedGitReference
-		)
 	}
 
 	/// Call SPM's dependency resolver, feeding it information about the dependency graph, and send the package
 	/// bindings it returns.
 	private func solve(
-		dependencies: [PackageContainerConstraint],
-		pins: [PackageContainerConstraint]
-	) -> SignalProducer<DependencyResolver.Binding, CarthageError> {
+		dependencies: [Constraint],
+		pins: [Constraint]
+	) -> SignalProducer<(container: Dependency, binding: BoundVersion), CarthageError> {
 		let provider = Provider(
 			versionsForDependency: versionsForDependency,
 			dependenciesForDependency: dependenciesForDependency,
@@ -180,7 +171,7 @@ public struct SPMResolver: ResolverProtocol {
 		// skipUpdate's value doesn't matter, because Carthage always fetches dependency repos before resolving.
 		// SPM supports deferring this step to when `Provider.getContainer` is called and allowing it to be
 		// selectively disabled.
-		let resolver = DependencyResolver(provider, nil, isPrefetchingEnabled: true, skipUpdate: false)
+		let resolver = DependencyResolver<Provider, NoDelegate<Dependency>>(provider, nil, isPrefetchingEnabled: true, skipUpdate: false)
 
 		// Pins don't add to the add to the working set of dependencies the resolver is using; they only impose
 		// additional constraints on the `dependencies` given. This means that `pins` can contain older resolved
@@ -196,10 +187,50 @@ public struct SPMResolver: ResolverProtocol {
 			return SignalProducer(bindings)
 
 		case .unsatisfiable(let unsatisfiableDependencies, let unsatisfiablePins):
-			let diagnostics = ResolverDiagnostics.Unsatisfiable(dependencies: unsatisfiableDependencies, pins: unsatisfiablePins)
-			// TODO: try to make this an .incompatibleRequirements error. This may be tricky because the resolver
-			// doesn't seem to reveal the dependencies that contain the problematic versions.
-			return SignalProducer(error: .internalError(description: diagnostics.description))
+      let requirements = dependencies + pins
+      let unsatisfiableRequirements = unsatisfiableDependencies + unsatisfiablePins
+
+      // unsatisfiableRequirements may contain the constraints that must be removed in order to make the graph
+      // resolvable. SPM doesn't provide any information about the graph itself, and unsatisfiableRequirements
+      // may be empty if the debugging algorithm timed out.
+
+      #if false
+      guard let requirement = unsatisfiableRequirements.first else {
+        fatalError() // TODO the debugger timed out or something
+      }
+
+      return SignalProducer(error: .incompatibleRequirements(
+        requirement.identifier,
+        (specifier: VersionSpecifier.from(requirement.requirement), fromDependency: requirement.identifier),
+        nil
+      ))
+      #endif
+
+      return SignalProducer(unsatisfiableRequirements)
+        .attemptMap { requirement -> Result<(Constraint, Constraint), CarthageError> in
+          guard let conflictingRequirement = requirements.filter({ constraint in
+            // Using the input constraints, find a constraint that
+            PackageContainerConstraintSet<DependencyContainer>().merging(requirement)?.merging(constraint) == nil
+          }).first else {
+            fatalError("Failed to find a conflicting requirement for unsatisfiable dependency \(requirement)")
+          }
+          return .success((requirement, conflictingRequirement))
+        }
+        .take(first: 1).attemptMap { pair in
+          let (requirement, conflictingRequirement) = pair
+          return .failure(.incompatibleRequirements(
+            requirement.identifier,
+            (specifier: VersionSpecifier.from(requirement.requirement), fromDependency: requirement.identifier),
+            (specifier: VersionSpecifier.from(conflictingRequirement.requirement), fromDependency: conflictingRequirement.identifier)
+          ))
+      }
+
+      #if false
+      let diagnostics = ResolverDiagnostics.Unsatisfiable(dependencies: unsatisfiableDependencies, pins: unsatisfiablePins)
+      // TODO: try to make this an .incompatibleRequirements error. This may be tricky because the resolver
+      // doesn't seem to reveal the dependencies that contain the problematic versions.
+      return SignalProducer(error: .internalError(description: diagnostics.description))
+      #endif
 
 		case .error(let error):
 			return SignalProducer(error: .internalError(description: String(describing: error)))
@@ -208,30 +239,27 @@ public struct SPMResolver: ResolverProtocol {
 
 	/// Convert bound versions from SPM to pinned versions by finding a committish whose parsed version matches the binding.
 	func pinnedDependency(
-		for identifier: PackageReference,
+		for dependency: Dependency,
 		boundVersion: BoundVersion
 	) -> SignalProducer<(Dependency, PinnedVersion), CarthageError> {
-		return SignalProducer(result: Dependency.from(packageReference: identifier).mapError(CarthageError.init))
-			.flatMap(.concat) { dependency -> SignalProducer<(Dependency, PinnedVersion), CarthageError> in
-				switch boundVersion {
-				case .excluded:
-					// To be correct, the resolver needs to ensure that this package is _not present_ in the resulting
-					// checkout, i.e. it needs not send the dependency even if it's in a preexisting Cartfile. I'm not
-					// aware of any circumstances in Carthage that might cause this.
-					fatalError()
-				case .revision(let ref):
-					return SignalProducer(value: (dependency, PinnedVersion(ref)))
-				case .unversioned:
-					// Carthage doesn't have unversioned dependencies; every dependency has a version, even if it's just a
-					// committish being pointed to.
-					fatalError()
-				case .version(let version):
-					return self.versionsForDependency(dependency)
-						.filter { Version.from($0).value == version }
-						.take(first: 1)
-						.map { (dependency, $0) }
-				}
-		}
+    switch boundVersion {
+    case .excluded:
+      // To be correct, the resolver needs to ensure that this package is _not present_ in the resulting
+      // checkout, i.e. it needs not send the dependency even if it's in a preexisting Cartfile. I'm not
+      // aware of any circumstances in Carthage that might cause this.
+      fatalError()
+    case .revision(let ref):
+      return SignalProducer(value: (dependency, PinnedVersion(ref)))
+    case .unversioned:
+      // Carthage doesn't have unversioned dependencies; every dependency has a version, even if it's just a
+      // committish being pointed to.
+      fatalError()
+    case .version(let version):
+      return self.versionsForDependency(dependency)
+        .filter { Version.from($0).value == version }
+        .take(first: 1)
+        .map { (dependency, $0) }
+    }
 	}
 }
 
@@ -244,29 +272,27 @@ private struct Provider: PackageContainerProvider {
 		targeting: DispatchQueue(label: "org.carthage.CarthageKit.SPMResolver.getContainer", attributes: .concurrent)
 	)
 
-	func getContainer(for identifier: PackageReference, skipUpdate: Bool, completion: @escaping (SPMResult<PackageContainer, AnyError>) -> Void) {
-		SignalProducer(result: Dependency.from(packageReference: identifier))
-			.observe(on: self.scheduler)
-			.mapError(CarthageError.init)
-			.flatMap(.concat) { dependency in
-				DependencyContainer.from(
-					dependency: dependency,
-					pinnedVersions: self.versionsForDependency(dependency),
-					dependenciesForVersion: { pinnedVersion in self.dependenciesForDependency(dependency, pinnedVersion) },
-					resolvedGitReference: self.resolvedGitReference
-				)
-			}
-			.map { $0 as PackageContainer }
-			.startWithResult { result in
-				switch result {
-				case .success(let container):
-					completion(.success(container))
-				case .failure(let error):
-					completion(.failure(AnyError(error)))
-				}
-		}
+	func getContainer(for dependency: Dependency, skipUpdate: Bool, completion: @escaping (SPMResult<DependencyContainer, AnyError>) -> Void) {
+    DependencyContainer.from(
+      dependency: dependency,
+      pinnedVersions: versionsForDependency(dependency),
+      dependenciesForVersion: { pinnedVersion in self.dependenciesForDependency(dependency, pinnedVersion) },
+      resolvedGitReference: resolvedGitReference
+      )
+      .observe(on: self.scheduler)
+      .startWithResult { result in
+        switch result {
+        case .success(let container):
+          completion(.success(container))
+        case .failure(let error):
+          completion(.failure(AnyError(error)))
+        }
+    }
 	}
 }
+
+/// A DependencyResolverDelegate that does nothing and cannot be instantiated.
+private enum NoDelegate<Identifier: PackageContainerIdentifier>: DependencyResolverDelegate { }
 
 // MARK: - Package container
 
@@ -280,8 +306,8 @@ private class DependencyContainer {
 	let dependenciesForVersion: (PinnedVersion) -> SignalProducer<(Dependency, VersionSpecifier), CarthageError>
 	let resolvedGitReference: (Dependency, String) -> SignalProducer<PinnedVersion, CarthageError>
 
-	var cachedDependenciesForVersion: [Version: [PackageContainerConstraint]] = [:]
-	var cachedDependenciesForRevision: [String: [PackageContainerConstraint]] = [:]
+	var cachedDependenciesForVersion: [Version: [Constraint]] = [:]
+	var cachedDependenciesForRevision: [String: [Constraint]] = [:]
 
 	private init(
 		dependency: Dependency,
@@ -327,11 +353,11 @@ private class DependencyContainer {
 }
 
 extension DependencyContainer: PackageContainer {
-	var identifier: PackageReference {
-		return PackageReference.from(dependency: dependency)
+	var identifier: Dependency {
+		return dependency
 	}
 
-	private func constraints(at pinnedVersion: PinnedVersion) -> SignalProducer<PackageContainerConstraint, CarthageError> {
+	private func constraints(at pinnedVersion: PinnedVersion) -> SignalProducer<Constraint, CarthageError> {
 		return dependenciesForVersion(pinnedVersion)
 			.flatMap(.concat) { dependency, versionSpecifier -> SignalProducer<(Dependency, VersionSpecifier), CarthageError> in
 					if case .gitReference(let revision) = versionSpecifier {
@@ -342,8 +368,8 @@ extension DependencyContainer: PackageContainer {
 					}
 			}
 			.map({ dependency, versionSpecifier in
-				PackageContainerConstraint(
-					container: PackageReference.from(dependency: dependency),
+				Constraint(
+					container: dependency,
 					requirement: PackageRequirement.from(versionSpecifier)
 				)
 			})
@@ -353,7 +379,7 @@ extension DependencyContainer: PackageContainer {
 		return AnySequence(versions.filter(isIncluded))
 	}
 
-	func getDependencies(at version: Version) throws -> [PackageContainerConstraint] {
+	func getDependencies(at version: Version) throws -> [Constraint] {
 		if let cachedDependencies = cachedDependenciesForVersion[version] {
 			return cachedDependencies
 		}
@@ -367,7 +393,7 @@ extension DependencyContainer: PackageContainer {
 		return dependencies
 	}
 
-	func getDependencies(at revision: String) throws -> [PackageContainerConstraint] {
+	func getDependencies(at revision: String) throws -> [Constraint] {
 		if let cachedDependencies = cachedDependenciesForRevision[revision] {
 			return cachedDependencies
 		}
@@ -378,12 +404,12 @@ extension DependencyContainer: PackageContainer {
 		return dependencies
 	}
 
-	func getUnversionedDependencies() throws -> [PackageContainerConstraint] {
+	func getUnversionedDependencies() throws -> [Constraint] {
     // Carthage doesn't have a concept of unversioned dependencies, but this may be called by the constraint debugger.
     return []
 	}
 
-	func getUpdatedIdentifier(at boundVersion: BoundVersion) throws -> PackageReference {
+	func getUpdatedIdentifier(at boundVersion: BoundVersion) throws -> Dependency {
 		return identifier
 	}
 }
@@ -398,7 +424,6 @@ extension DependencyContainer: Hashable {
 		hasher.combine(versions)
 	}
 }
-
 
 
 // MARK: - Conversions
@@ -451,25 +476,6 @@ private extension VersionSpecifier {
 	}
 }
 
-
-private extension PackageReference {
-	static func from(dependency: Dependency) -> PackageReference {
-		return PackageReference(
-			identity: dependency.name.lowercased(),
-			path: dependency.description,
-			name: dependency.name,
-			isLocal: false
-		)
-	}
-}
-
-private extension Dependency {
-	static func from(packageReference: PackageReference) -> Result<Dependency, ScannableError> {
-		let scanner = Scanner(string: packageReference.path)
-		return Dependency.from(scanner, base: nil)
-	}
-}
-
 extension SPMResult {
 	static func from(result: Result<Value, ErrorType>) -> SPMResult<Value, ErrorType> {
 		switch result {
@@ -478,12 +484,5 @@ extension SPMResult {
 		case .success(let success):
 			return .success(success)
 		}
-	}
-}
-
-private extension PackageContainerConstraint {
-	init(_ pair: (DependencyContainer, VersionSpecifier)) {
-		let (package, pinnedVersion) = pair
-		self.init(container: package.identifier, requirement: PackageRequirement.from(pinnedVersion))
 	}
 }
