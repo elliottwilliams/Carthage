@@ -210,7 +210,7 @@ public struct SPMResolver: ResolverProtocol {
 		// skipUpdate's value doesn't matter, because Carthage always fetches dependency repos before resolving.
 		// SPM supports deferring this step to when `Provider.getContainer` is called and allowing it to be
 		// selectively disabled.
-		let resolver = DependencyResolver<Provider, NoDelegate<Dependency>>(provider, nil, isPrefetchingEnabled: true, skipUpdate: false)
+		let resolver = DependencyResolver<Provider, SPMResolver>(provider, self, isPrefetchingEnabled: true, skipUpdate: false)
 
 		// Pins don't add to the add to the working set of dependencies the resolver is using; they only impose
 		// additional constraints on the `dependencies` given. This means that `pins` can contain older resolved
@@ -277,6 +277,10 @@ public struct SPMResolver: ResolverProtocol {
 			return SignalProducer(error: .spmResolverError(.internalError(otherError)))
 		}
 	}
+
+/// `DependencyResolver` doesn't do anything by default with its delegate, but is specialized over a delegate type.
+extension SPMResolver: DependencyResolverDelegate {
+	public typealias Identifier = Dependency
 }
 
 /// An object queried by SPM to determine available versions and dependencies of some dependency.
