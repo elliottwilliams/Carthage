@@ -71,13 +71,9 @@ public struct SPMResolver: ResolverProtocol {
 
 		// Using package constraints for the Cartfile dependencies and pins based on dependenciesToUpdate...
 		return constraints(for: dependenciesProducer).combineLatest(with: constraints(for: pinsProducer))
-			// call the solver...
+			// call the resolver...
 			.observe(on: resolverQueue)
-			.flatMap(.concat) { dependencies, pins in
-				self.solve(dependencies: dependencies, pins: pins).mapError(CarthageError.spmResolverError)
-			}
-			// convert SPM's binding type into (Dependency, PinnedVersion)...
-			.flatMap(.concat, pinnedDependency)
+			.flatMap(.concat, resolve)
 			// and collect into a dictionary.
 			.reduce(into: [Dependency: PinnedVersion]()) { resolution, pair in
 				let (dependency, pinnedVersion) = pair
@@ -165,11 +161,10 @@ public struct SPMResolver: ResolverProtocol {
 
 		/// A dependency given using a version requirement has one or more subdependencies with a git revision
 		/// requirement. This is unsupported by SPM.
-		case gitRequirementsOfVersionedDependency(Dependency, version: Version, subdependencies: [Dependency: PinnedVersion])
+		case gitRequirementsOnVersionedDependency(Dependency, version: Version, subdependencies: [Dependency: PinnedVersion])
 
 		/// Internal error in SPM's dependency resolver
 		case internalError(Swift.Error)
-
 
 		public var description: String {
 			switch self {
@@ -179,7 +174,7 @@ public struct SPMResolver: ResolverProtocol {
 					}.joined(separator: "\n")
 				return "The following dependencies introduce conflicting requirements:\n\(dependencies)"
 
-			case let .gitRequirementsOfVersionedDependency(dependency, version, subdependencies):
+			case let .gitRequirementsOnVersionedDependency(dependency, version, subdependencies):
 				let revisions = subdependencies.map { dependency, pinnedVersion in
 					"\t\(dependency) \(pinnedVersion)"
 					}.joined(separator: "\n")
@@ -198,10 +193,10 @@ public struct SPMResolver: ResolverProtocol {
 
 	/// Call SPM's dependency resolver, feeding it information about the dependency graph, and send the package
 	/// bindings it returns.
-	private func solve(
+	private func resolve(
 		dependencies: [Constraint],
 		pins: [Constraint]
-	) -> SignalProducer<(container: Dependency, binding: BoundVersion), Error> {
+	) -> SignalProducer<(Dependency, PinnedVersion), CarthageError> {
 		let provider = Provider(
 			versionsForDependency: versionsForDependency,
 			dependenciesForDependency: dependenciesForDependency,
@@ -223,7 +218,26 @@ public struct SPMResolver: ResolverProtocol {
 
 		switch result {
 		case let .success(bindings):
-			return SignalProducer(bindings)
+			return SignalProducer(bindings).flatMap(.concat) { dependency, boundVersion in
+				switch boundVersion {
+				case .excluded:
+					// This binding indicates that the dependency must _not be present_ in the resulting
+					// checkout, i.e. it would need to not send the dependency even if it's in a preexisting Cartfile. I'm
+					// not aware of any circumstances in Carthage that might cause this.
+					fatalError("DependencyResolver produced an .excluded binding.")
+				case .unversioned:
+					// Carthage doesn't have unversioned dependencies; every dependency has a version, even if it's just a
+					// committish being pointed at.
+					fatalError("DependencyResolver produced an .unversioned binding.")
+				case .revision(let ref):
+					return SignalProducer(value: (dependency, PinnedVersion(ref)))
+				case .version(let version):
+					return self.versionsForDependency(dependency)
+						.filter { Version.from($0).value == version }
+						.take(first: 1)
+						.map { (dependency, $0) }
+				}
+			}
 
 		case let .unsatisfiable(unsatisfiableDependencies, unsatisfiablePins):
       let unsatisfiableRequirements = unsatisfiableDependencies + unsatisfiablePins
@@ -232,11 +246,11 @@ public struct SPMResolver: ResolverProtocol {
       // resolvable. SPM doesn't provide any information about the graph itself, and unsatisfiableRequirements
       // may be empty if the debugging algorithm timed out.
 
-			return SignalProducer(error: .unsatifiableRequirements(
+			return SignalProducer(error: .spmResolverError(.unsatifiableRequirements(
 				unsatisfiableRequirements.reduce(into: [:]) { reqs, constraint in
 					reqs[constraint.identifier] = VersionSpecifier.from(constraint.requirement)
 				}
-				))
+			)))
 
 		case let .error(DependencyResolverError.incompatibleConstraints((dependencyIdentifier, versionDescription), revisions)):
 			guard let dependency = dependencyIdentifier.identifier as? Dependency,
@@ -252,36 +266,11 @@ public struct SPMResolver: ResolverProtocol {
 				subdependencies[dependency] = PinnedVersion(gitReference)
 			}
 
-			return SignalProducer(error: .gitRequirementsOfVersionedDependency(dependency, version: version, subdependencies: subdependencies))
+			return SignalProducer(error: .spmResolverError(.gitRequirementsOnVersionedDependency(dependency, version: version, subdependencies: subdependencies)))
 
 		case let .error(otherError):
-			return SignalProducer(error: .internalError(otherError))
+			return SignalProducer(error: .spmResolverError(.internalError(otherError)))
 		}
-	}
-
-	/// Convert bound versions from SPM to pinned versions by finding a committish whose parsed version matches the binding.
-	func pinnedDependency(
-		for dependency: Dependency,
-		boundVersion: BoundVersion
-	) -> SignalProducer<(Dependency, PinnedVersion), CarthageError> {
-    switch boundVersion {
-    case .excluded:
-      // To be correct, the resolver needs to ensure that this package is _not present_ in the resulting
-      // checkout, i.e. it needs not send the dependency even if it's in a preexisting Cartfile. I'm not
-      // aware of any circumstances in Carthage that might cause this.
-      fatalError()
-    case .revision(let ref):
-      return SignalProducer(value: (dependency, PinnedVersion(ref)))
-    case .unversioned:
-      // Carthage doesn't have unversioned dependencies; every dependency has a version, even if it's just a
-      // committish being pointed to.
-      fatalError()
-    case .version(let version):
-      return self.versionsForDependency(dependency)
-        .filter { Version.from($0).value == version }
-        .take(first: 1)
-        .map { (dependency, $0) }
-    }
 	}
 }
 
@@ -450,7 +439,6 @@ extension DependencyContainer: Hashable {
 
 // MARK: - Conversions
 
-// TODO: emw: Is there a better way to determine the upper bound? Almost certainly.
 private extension Version {
 	/// The largest expressible version. Used to convert Carthage's `atLeast` version specifier to SPM's `versionSet`.
 	static var max: Version {
