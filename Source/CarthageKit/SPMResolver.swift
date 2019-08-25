@@ -190,47 +190,23 @@ public struct SPMResolver: ResolverProtocol {
       let requirements = dependencies + pins
       let unsatisfiableRequirements = unsatisfiableDependencies + unsatisfiablePins
 
-      // unsatisfiableRequirements may contain the constraints that must be removed in order to make the graph
+      // unsatisfiableRequirements contain any Cartfile requirements that must be removed in order to make the graph
       // resolvable. SPM doesn't provide any information about the graph itself, and unsatisfiableRequirements
       // may be empty if the debugging algorithm timed out.
 
-      #if false
-      guard let requirement = unsatisfiableRequirements.first else {
-        fatalError() // TODO the debugger timed out or something
+      func repositoryPackageConstraint(for constraint: Constraint) -> RepositoryPackageConstraint {
+        let dependency = constraint.identifier
+        return RepositoryPackageConstraint(
+          container: PackageReference(identity: dependency.name.lowercased(), path: dependency.relativePath),
+          requirement: constraint.requirement
+        )
       }
 
-      return SignalProducer(error: .incompatibleRequirements(
-        requirement.identifier,
-        (specifier: VersionSpecifier.from(requirement.requirement), fromDependency: requirement.identifier),
-        nil
-      ))
-      #endif
-
-      return SignalProducer(unsatisfiableRequirements)
-        .attemptMap { requirement -> Result<(Constraint, Constraint), CarthageError> in
-          guard let conflictingRequirement = requirements.filter({ constraint in
-            // Using the input constraints, find a constraint that
-            PackageContainerConstraintSet<DependencyContainer>().merging(requirement)?.merging(constraint) == nil
-          }).first else {
-            fatalError("Failed to find a conflicting requirement for unsatisfiable dependency \(requirement)")
-          }
-          return .success((requirement, conflictingRequirement))
-        }
-        .take(first: 1).attemptMap { pair in
-          let (requirement, conflictingRequirement) = pair
-          return .failure(.incompatibleRequirements(
-            requirement.identifier,
-            (specifier: VersionSpecifier.from(requirement.requirement), fromDependency: requirement.identifier),
-            (specifier: VersionSpecifier.from(conflictingRequirement.requirement), fromDependency: conflictingRequirement.identifier)
-          ))
-      }
-
-      #if false
-      let diagnostics = ResolverDiagnostics.Unsatisfiable(dependencies: unsatisfiableDependencies, pins: unsatisfiablePins)
-      // TODO: try to make this an .incompatibleRequirements error. This may be tricky because the resolver
-      // doesn't seem to reveal the dependencies that contain the problematic versions.
+      let diagnostics = ResolverDiagnostics.Unsatisfiable(
+        dependencies: unsatisfiableDependencies.map(repositoryPackageConstraint(for:)),
+        pins: unsatisfiablePins.map(repositoryPackageConstraint(for:))
+      )
       return SignalProducer(error: .internalError(description: diagnostics.description))
-      #endif
 
 		case .error(let error):
 			return SignalProducer(error: .internalError(description: String(describing: error)))
