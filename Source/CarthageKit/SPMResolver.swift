@@ -73,7 +73,9 @@ public struct SPMResolver: ResolverProtocol {
 		return constraints(for: dependenciesProducer).combineLatest(with: constraints(for: pinsProducer))
 			// call the solver...
 			.observe(on: resolverQueue)
-			.flatMap(.concat, solve)
+			.flatMap(.concat) { dependencies, pins in
+				self.solve(dependencies: dependencies, pins: pins).mapError(CarthageError.spmResolverError)
+			}
 			// convert SPM's binding type into (Dependency, PinnedVersion)...
 			.flatMap(.concat, pinnedDependency)
 			// and collect into a dictionary.
@@ -157,12 +159,49 @@ public struct SPMResolver: ResolverProtocol {
 			.collect()
 	}
 
+	public enum Error: Swift.Error, CustomStringConvertible {
+		/// One or more Cartfile dependencies have subdependencies with incompatible version specifiers.
+		case unsatifiableRequirements([Dependency: VersionSpecifier])
+
+		/// A dependency given using a version requirement has one or more subdependencies with a git revision
+		/// requirement. This is unsupported by SPM.
+		case gitRequirementsOfVersionedDependency(Dependency, version: Version, subdependencies: [Dependency: PinnedVersion])
+
+		/// Internal error in SPM's dependency resolver
+		case internalError(Swift.Error)
+
+
+		public var description: String {
+			switch self {
+			case let .unsatifiableRequirements(dependencies):
+				let dependencies = dependencies.map { dependency, versionSpecifier in
+					"\t\(dependency) \(versionSpecifier)"
+					}.joined(separator: "\n")
+				return "The following dependencies introduce conflicting requirements:\n\(dependencies)"
+
+			case let .gitRequirementsOfVersionedDependency(dependency, version, subdependencies):
+				let revisions = subdependencies.map { dependency, pinnedVersion in
+					"\t\(dependency) \(pinnedVersion)"
+					}.joined(separator: "\n")
+
+				return """
+				\(dependency) at \(version) has requirements which are pinned to git revisions:
+				\(revisions)
+				This is unsupported when using --spm-resolver.
+				"""
+
+			case let .internalError(error):
+				return error.localizedDescription
+			}
+		}
+	}
+
 	/// Call SPM's dependency resolver, feeding it information about the dependency graph, and send the package
 	/// bindings it returns.
 	private func solve(
 		dependencies: [Constraint],
 		pins: [Constraint]
-	) -> SignalProducer<(container: Dependency, binding: BoundVersion), CarthageError> {
+	) -> SignalProducer<(container: Dependency, binding: BoundVersion), Error> {
 		let provider = Provider(
 			versionsForDependency: versionsForDependency,
 			dependenciesForDependency: dependenciesForDependency,
@@ -183,33 +222,40 @@ public struct SPMResolver: ResolverProtocol {
 		)
 
 		switch result {
-		case .success(let bindings):
+		case let .success(bindings):
 			return SignalProducer(bindings)
 
-		case .unsatisfiable(let unsatisfiableDependencies, let unsatisfiablePins):
-      let requirements = dependencies + pins
+		case let .unsatisfiable(unsatisfiableDependencies, unsatisfiablePins):
       let unsatisfiableRequirements = unsatisfiableDependencies + unsatisfiablePins
 
       // unsatisfiableRequirements contain any Cartfile requirements that must be removed in order to make the graph
       // resolvable. SPM doesn't provide any information about the graph itself, and unsatisfiableRequirements
       // may be empty if the debugging algorithm timed out.
 
-      func repositoryPackageConstraint(for constraint: Constraint) -> RepositoryPackageConstraint {
-        let dependency = constraint.identifier
-        return RepositoryPackageConstraint(
-          container: PackageReference(identity: dependency.name.lowercased(), path: dependency.relativePath),
-          requirement: constraint.requirement
-        )
-      }
+			return SignalProducer(error: .unsatifiableRequirements(
+				unsatisfiableRequirements.reduce(into: [:]) { reqs, constraint in
+					reqs[constraint.identifier] = VersionSpecifier.from(constraint.requirement)
+				}
+				))
 
-      let diagnostics = ResolverDiagnostics.Unsatisfiable(
-        dependencies: unsatisfiableDependencies.map(repositoryPackageConstraint(for:)),
-        pins: unsatisfiablePins.map(repositoryPackageConstraint(for:))
-      )
-      return SignalProducer(error: .internalError(description: diagnostics.description))
+		case let .error(DependencyResolverError.incompatibleConstraints((dependencyIdentifier, versionDescription), revisions)):
+			guard let dependency = dependencyIdentifier.identifier as? Dependency,
+				let version = Version(string: versionDescription) else {
+					fatalError("DependencyResolver returned an .incompatibleConstraints error but did not provide valid types.")
+			}
 
-		case .error(let error):
-			return SignalProducer(error: .internalError(description: String(describing: error)))
+			let subdependencies: [Dependency: PinnedVersion] = revisions.reduce(into: [:]) { subdependencies, pair in
+				let (dependencyIdentifier, gitReference) = pair
+				guard let dependency = dependencyIdentifier.identifier as? Dependency else {
+					fatalError("DependencyResolver returned an .incompatibleConstraints error but did not provide valid types.")
+				}
+				subdependencies[dependency] = PinnedVersion(gitReference)
+			}
+
+			return SignalProducer(error: .gitRequirementsOfVersionedDependency(dependency, version: version, subdependencies: subdependencies))
+
+		case let .error(otherError):
+			return SignalProducer(error: .internalError(otherError))
 		}
 	}
 

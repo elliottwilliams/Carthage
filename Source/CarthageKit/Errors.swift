@@ -22,6 +22,9 @@ public enum CarthageError: Error {
 	/// Incompatible version specifiers were given for a dependency.
 	case incompatibleRequirements(Dependency, VersionRequirement, VersionRequirement)
 
+	/// The SPM package resolver failed dependency resolution.
+	case spmResolverError(SPMResolver.Error)
+
 	/// No tagged versions could be found for the dependency.
 	case taggedVersionNotFound(Dependency)
 
@@ -239,6 +242,9 @@ extension CarthageError: CustomStringConvertible {
 				return "\(specifier)" + (fromDependency.map { " (\($0))" } ?? "")
 			}
 			return "Could not pick a version for \(dependency), due to mutually incompatible requirements:\n\t\(requirement(first))\n\t\(requirement(second))"
+
+		case let .spmResolverError(error):
+			return error.description
 
 		case let .taggedVersionNotFound(dependency):
 			return "No tagged versions found for \(dependency)"
