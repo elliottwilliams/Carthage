@@ -1,11 +1,16 @@
+import Basic
 import Foundation
 import PackageGraph
 import PackageModel
 import ReactiveSwift
-import Result
 import enum Workspace.ResolverDiagnostics
-import struct Basic.AnyError
 
+// Result must be imported as an enum because `Basic` exposes SPM's own `Result` type and leads to name ambiguity.
+// `Result.Result` can't be used to disambiguate, because name lookup prioritizes types over modules. But since
+// scoped imports are preferred over regular imports, this imports means that "Result" refers to Result.Result
+// and "Basic.Result" refers to SPM's Result.
+// https://forums.swift.org/t/accepted-with-modifications-se-0235-add-result-to-the-standard-library/18603/44
+import enum Result.Result
 
 extension Dependency: PackageContainerIdentifier {}
 private typealias Constraint = PackageContainerConstraint<Dependency>
@@ -283,7 +288,7 @@ private struct Provider: PackageContainerProvider {
 		targeting: DispatchQueue(label: "org.carthage.CarthageKit.SPMResolver.getContainer", attributes: .concurrent)
 	)
 
-	func getContainer(for dependency: Dependency, skipUpdate: Bool, completion: @escaping (SPMResult<DependencyContainer, AnyError>) -> Void) {
+	func getContainer(for dependency: Dependency, skipUpdate: Bool, completion: @escaping (Basic.Result<DependencyContainer, Basic.AnyError>) -> Void) {
     DependencyContainer.from(
       dependency: dependency,
       pinnedVersions: versionsForDependency(dependency),
@@ -486,8 +491,8 @@ private extension VersionSpecifier {
 	}
 }
 
-extension SPMResult {
-	static func from(result: Result<Value, ErrorType>) -> SPMResult<Value, ErrorType> {
+extension Basic.Result {
+	static func from(result: Result<Value, ErrorType>) -> Basic.Result<Value, ErrorType> {
 		switch result {
 		case .failure(let error):
 			return .failure(error)
