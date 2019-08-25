@@ -35,7 +35,7 @@ public struct SPMResolver: ResolverProtocol {
 		self.resolvedGitReference = resolvedGitReference
 	}
 
-	// MARK: - Upper half: Interaction with the project
+	// MARK: Resolver entry point
 
 	public func resolve(
 		dependencies: [Dependency : VersionSpecifier],
@@ -86,6 +86,8 @@ public struct SPMResolver: ResolverProtocol {
 		}
 	}
 
+	// MARK: Private subroutines
+
 	/// Sends a dictionary of dependencies and their specified versions by subtracting dependencies mentioned in
 	/// `dependencyNamesToUpdate` from `resolvedDependencies`. The resulting dictionary represents the dependencies
 	/// which should be "pinned" and not be changed from their specified versions.
@@ -135,8 +137,6 @@ public struct SPMResolver: ResolverProtocol {
 		}
 	}
 
-	// MARK: - Lower half: SPM bridging
-
 	/// Converts dependency requirements to package constraints.
 	private func constraints(
 		for dependencies: SignalProducer<[Dependency: VersionSpecifier], CarthageError>
@@ -158,42 +158,6 @@ public struct SPMResolver: ResolverProtocol {
         Constraint(container: dependency, requirement: PackageRequirement.from(versionSpecifier))
 			}
 			.collect()
-	}
-
-	public enum Error: Swift.Error, CustomStringConvertible {
-		/// One or more Cartfile dependencies have subdependencies with incompatible version specifiers.
-		case unsatifiableRequirements([Dependency: VersionSpecifier])
-
-		/// A dependency given using a version requirement has one or more subdependencies with a git revision
-		/// requirement. This is unsupported by SPM.
-		case gitRequirementsOnVersionedDependency(Dependency, version: Version, subdependencies: [Dependency: PinnedVersion])
-
-		/// Internal error in SPM's dependency resolver
-		case internalError(Swift.Error)
-
-		public var description: String {
-			switch self {
-			case let .unsatifiableRequirements(dependencies):
-				let dependencies = dependencies.map { dependency, versionSpecifier in
-					"\t\(dependency) \(versionSpecifier)"
-					}.joined(separator: "\n")
-				return "The following dependencies introduce conflicting requirements:\n\(dependencies)"
-
-			case let .gitRequirementsOnVersionedDependency(dependency, version, subdependencies):
-				let revisions = subdependencies.map { dependency, pinnedVersion in
-					"\t\(dependency) \(pinnedVersion)"
-					}.joined(separator: "\n")
-
-				return """
-				\(dependency) at \(version) has requirements which are pinned to git revisions:
-				\(revisions)
-				This is unsupported when using --spm-resolver.
-				"""
-
-			case let .internalError(error):
-				return error.localizedDescription
-			}
-		}
 	}
 
 	/// Call SPM's dependency resolver, feeding it information about the dependency graph, and send the package
@@ -255,7 +219,7 @@ public struct SPMResolver: ResolverProtocol {
 				unsatisfiableRequirements.reduce(into: [:]) { reqs, constraint in
 					reqs[constraint.identifier] = VersionSpecifier.from(constraint.requirement)
 				}
-			)))
+				)))
 
 		case let .error(DependencyResolverError.incompatibleConstraints((dependencyIdentifier, versionDescription), revisions)):
 			guard let dependency = dependencyIdentifier.identifier as? Dependency,
@@ -271,12 +235,49 @@ public struct SPMResolver: ResolverProtocol {
 				subdependencies[dependency] = PinnedVersion(gitReference)
 			}
 
-			return SignalProducer(error: .spmResolverError(.gitRequirementsOnVersionedDependency(dependency, version: version, subdependencies: subdependencies)))
+			return SignalProducer(error: .spmResolverError(.gitRequirementsOnVersionedDependency(dependency, version, subdependencies: subdependencies)))
 
 		case let .error(otherError):
 			return SignalProducer(error: .spmResolverError(.internalError(otherError)))
 		}
 	}
+
+	public enum Error: Swift.Error, CustomStringConvertible {
+		/// One or more Cartfile dependencies have subdependencies with incompatible version specifiers.
+		case unsatifiableRequirements([Dependency: VersionSpecifier])
+
+		/// A dependency given using a version requirement has one or more subdependencies with a git revision
+		/// requirement. This is unsupported by SPM.
+		case gitRequirementsOnVersionedDependency(Dependency, Version, subdependencies: [Dependency: PinnedVersion])
+
+		/// Internal error in SPM's dependency resolver
+		case internalError(Swift.Error)
+
+		public var description: String {
+			switch self {
+			case let .unsatifiableRequirements(dependencies):
+				let dependencies = dependencies.map { dependency, versionSpecifier in
+					"\t\(dependency) \(versionSpecifier)"
+					}.joined(separator: "\n")
+				return "The following dependencies introduce conflicting requirements:\n\(dependencies)"
+
+			case let .gitRequirementsOnVersionedDependency(dependency, version, subdependencies):
+				let revisions = subdependencies.map { dependency, pinnedVersion in
+					"\t\(dependency) \(pinnedVersion)"
+					}.joined(separator: "\n")
+
+				return """
+				\(dependency) at \(version) has requirements which are pinned to git revisions:
+				\(revisions)
+				This is unsupported when using --spm-resolver.
+				"""
+
+			case let .internalError(error):
+				return error.localizedDescription
+			}
+		}
+	}
+}
 
 /// `DependencyResolver` doesn't do anything by default with its delegate, but is specialized over a delegate type.
 extension SPMResolver: DependencyResolverDelegate {
@@ -311,16 +312,20 @@ private struct Provider: PackageContainerProvider {
 	}
 }
 
-/// A DependencyResolverDelegate that does nothing and cannot be instantiated.
-private enum NoDelegate<Identifier: PackageContainerIdentifier>: DependencyResolverDelegate { }
+// MARK: - Container data structure
 
-// MARK: - Package container
-
-/// Represents a dependency, its available versions, and their corresponding git references. g
-/// facilitates bridging between SPM and Carthage.
+/// Represents a dependency, its available versions, and their corresponding git references. `DependencyContainer`
+/// bridges between SPM's model of "a package which can provide dependency information about itself"
+/// and Carthage's model of "a project which can provide information on behalf of its dependencies".
 private class DependencyContainer {
 	let dependency: Dependency
+
+	// To be a `PackageContainer`, DependencyContainer must store all its versions. `versions` and `pinnedVersions`
+	// are produced from `SPMResolver.versionsForDependency` as part of DependencyContainer's initialization logic.
+
+	/// Known versions of `dependency`, sorted in descending versions order.
 	let versions: [Version]
+	/// Known versions of `dependency` and their corresponding git references.
 	let pinnedVersions: [Version: PinnedVersion]
 
 	let dependenciesForVersion: (PinnedVersion) -> SignalProducer<(Dependency, VersionSpecifier), CarthageError>
@@ -405,7 +410,7 @@ extension DependencyContainer: PackageContainer {
 		}
 
 		guard let pinnedVersion = pinnedVersions[version] else {
-			preconditionFailure()
+			preconditionFailure("DependencyResolver queried for version \(dependency) @ \(version), which does not exist.")
 		}
 
 		let dependencies = try constraints(at: pinnedVersion).collect().first()?.get() ?? []
