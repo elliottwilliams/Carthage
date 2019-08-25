@@ -303,11 +303,24 @@ class ResolverBehavior: Behavior<ResolverProtocol.Type> {
 				]
 
 				let resolved = db.resolve(resolverType, [ github1: .any, github2: .any ])
-				expect(resolved.value) == [
-					github3: PinnedVersion(sha),
-					github2: .v1_0_0,
-					github1: .v1_0_0,
-				]
+				if resolverType == SPMResolver.self {
+					let hasIncompatibleRequirements: Bool
+					switch resolved.error {
+					case .some(.spmResolverError(.gitRequirementsOnVersionedDependency)):
+						hasIncompatibleRequirements = true
+					default:
+						hasIncompatibleRequirements = false
+					}
+
+					expect(hasIncompatibleRequirements).to(beTrue())
+
+				} else {
+					expect(resolved.value) == [
+						github3: PinnedVersion(sha),
+						github2: .v1_0_0,
+						github1: .v1_0_0,
+					]
+				}
 			}
 
 			it("should correctly order transitive dependencies") {
