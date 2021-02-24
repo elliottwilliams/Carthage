@@ -174,8 +174,35 @@ public struct BuildSettings {
 	}
 
 	internal var frameworkSearchPaths: Result<[URL], CarthageError> {
-		return self["FRAMEWORK_SEARCH_PATHS"].map { paths in
-			paths.split(separator: " ").map { URL(fileURLWithPath: String($0), isDirectory: true) }
+		return self["FRAMEWORK_SEARCH_PATHS"].map { paths -> [URL] in
+			var quote = ""
+			var escaping = false
+			var next = ""
+
+			return paths.reduce(into: []) { searchPaths, character in
+				switch character {
+				case "\\":
+					if escaping {
+						next.append(character)
+					}
+					escaping.toggle()
+				case "'", "\"":
+					if quote.last == character {
+						quote.removeLast()
+					} else {
+						quote.append(character)
+					}
+				case " ":
+					if !escaping && quote.isEmpty {
+						searchPaths.append(URL(fileURLWithPath: next, isDirectory: true))
+					} else {
+						next.append(character)
+					}
+				default:
+					next.append(character)
+				}
+
+			}
 		}
 	}
 
